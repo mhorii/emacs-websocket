@@ -43,21 +43,44 @@
 (eval-when-compile (require 'cl))
 
 ;;; Code:
-(defstruct (websocket
-            (:constructor nil)
-            (:constructor websocket-inner-create))
-  "A websocket structure.
-This follows the W3C Websocket API, except translated to elisp
-idioms.  The API is implemented in both the websocket struct and
-additional methods.  Due to how defstruct slots are accessed, all
-API methods are prefixed with \"websocket-\" and take a websocket
-as an argument, so the distrinction between the struct API and
-the additional helper APIs are not visible to the caller.
+(defclass websocket ()
+  ((ready-state :initform connecting
+                :type (member connecting open close)
+                :documentation
+                "The state of the connection, either CONNECTING, OPEN or CLOSE"
+                :protection :public)
+   (server-extensions :type list
+                      :documentation "The list of extensions the server supports"
+                      :protection :protected)
+   (url :initarg :url
+        :type string
+        :documentation "The url this websocket is connecting to."
+        :protection :protected)
+   (protocol :initarg :protocol
+             :type string
+             :websocket "The protocol requested by the client"
+             :protection :protected)
+   (conn :initarg :conn
+         :type processp
+         :documentation "The connection process for this websocket."
+         :protection :private)
+   (accept-string :initarg :accept-string
+                  :type string
+                  :documentation
+                  "The websocket accept string we expect from the server."
+                  :protection :private)
+   (inflight-input :type string
+                   :initform ""
+                   :documentation
+                   "Input from the server that hasn't been processed yet."
+                   :protection :private))
+  :documentation
+  "A websocket class.
+This follows the W3C Websocket API, except translated to
+eioio (CLOS) idioms.  The API is implemented in both the
+websocket class and additional methods.
 
 A websocket struct is created with `websocket-open'.
-
-`ready-state' contains one of 'connecting, 'open, or
-'closed, depending on the state of the websocket.
 
 The W3C API \"bufferedAmount\" call is not currently implemented,
 since there is no elisp API to get the buffered amount from the
@@ -65,27 +88,184 @@ subprocess.  There may, in fact, be output data buffered,
 however, when the `on-message' or `close-callback' callbacks are
 called.
 
-`on-open', `on-message' and `on-close' are described in
-`websocket-open'.
+`on-open', `on-message' and `on-close' are methods that act on this class,
+and clients should override them to provide their needed functionality.")
 
-The `server-extensions' slot lists the extensions accepted by the
-server.
-"
-  ;; API
-  (ready-state 'connecting)
-  client-data
-  on-open
-  on-message
-  on-close
-  server-extensions
+(defmethod websocket-on-open ((ws websocket))
+  "Called when the websocket has established or re-established the connection.
 
-  ;; Other data - clients should not have to access this.
-  (url (assert nil) :read-only t)
-  (protocol nil :read-only t)
-  (extensions nil :read-only t)
-  (conn (assert nil) :read-only t)
-  (accept-string (assert nil))
-  (inflight-input nil))
+Putting all client initialization logic here is recommended.")
+
+(defmethod websocket-on-message ((ws websocket) frame)
+  "Called when the websocket has received FRAME.")
+
+(defmethod websocket-on-close ((ws websocket))
+  "Called when the websocket connection has been closed.")
+
+(defmethod websocket-debug ((ws websocket) msg &rest args)
+  "In the WEBSOCKET's debug buffer, send MSG, with format ARGS."
+  (when websocket-debug
+    (let ((buf (websocket-get-debug-buffer-create websocket)))
+      (save-excursion
+        (with-current-buffer buf
+          (goto-char (point-max))
+          (insert "[WS] ")
+          (insert (apply 'format (append (list msg) args)))
+          (insert "\n"))))))
+
+(defmethod websocket-send ((websocket websocket) frame)
+  "To the WEBSOCKET server, send the FRAME.
+This will raise an error if the frame is illegal."
+  (unless (websocket-check frame)
+    (error "Cannot send illegal frame to websocket"))
+  (websocket-debug websocket "Sending frame, opcode: %s payload: %s"
+                   (websocket-frame-opcode frame)
+                   (websocket-frame-payload frame))
+  (websocket-ensure-connected websocket)
+  (unless (websocket-openp websocket)
+    (error "No webserver process to send data to!"))
+  (process-send-string (slot-value websocket 'conn)
+                       (websocket-encode-frame frame)))
+
+(defmethod websocket-openp ((websocket websocket))
+  "Check WEBSOCKET and return non-nil if it is open, and either
+connecting or open."
+  (and websocket
+       (not (eq 'close (websocket-ready-state websocket)))
+       (eq 'open (process-status (websocket-conn websocket)))))
+
+(defmethod websocket-close ((websocket websocket))
+  "Close WEBSOCKET and erase all the old websocket data."
+  (websocket-debug websocket "Closing websocket")
+  (when (websocket-openp websocket)
+    (websocket-send websocket
+                    (make-websocket-frame :opcode 'close
+                                          :completep t))
+    (set-slot-value websocket 'ready-state 'close))
+  ;; Do we want to kill this?  It may result in on-closed not being
+  ;; called.
+  (kill-buffer (process-buffer (slot-value websocket 'conn))))
+
+(defmethod websocket-ensure-connected ((websocket websocket))
+  "If the WEBSOCKET connection is closed, open it."
+  (unless (and (websocket-conn websocket)
+               (ecase (process-status (websocket-conn websocket))
+                 ((run open listen) t)
+                 ((stop exit signal closed connect failed nil) nil)))
+    (websocket-close websocket)
+    (websocket-open (object-class websocket)
+                    (websocket-url websocket)
+                    :protocol (websocket-protocol websocket)
+                    :extensions (websocket-extensions websocket))))
+
+(defmethod websocket-outer-filter ((websocket websocket) output)
+  "Filter the WEBSOCKET server's OUTPUT.
+This will parse headers and process frames repeatedly until there
+is no more output or the connection closes.  If the websocket
+connection is invalid, the connection will be closed."
+  (websocket-debug websocket "Received: %s" output)
+  (let ((start-point)
+        (end-point 0)
+        (text (concat (slot-value websocket 'inflight-input) output))
+        (header-end-pos))
+    ;; If we've received the complete header, check to see if we've
+    ;; received the desired handshake.
+    (when (and (eq 'connecting (slot-value websocket 'ready-state))
+               (setq header-end-pos (string-match "\r\n\r\n" text))
+               (setq start-point (+ 4 header-end-pos)))
+      (condition-case err
+          (progn
+            (websocket-verify-response-code text)
+            (websocket-verify-headers websocket text))
+        (error
+         (websocket-close websocket)
+         (error err)))
+      (set-slot-value 'ready-state 'open)
+      (condition-case err (websocket-on-open websocket) 
+        (error (websocket-error websocket
+                                "Got error from the on-open function: %s"
+                                (error-message-string err)))))
+    (when (eq 'open (slot-value websocket 'ready-state))
+      (unless start-point (setq start-point 0))
+      (let ((current-frame))
+        (while (and (setq current-frame (websocket-read-frame
+                                         (substring text start-point))))
+          (websocket-process-frame websocket current-frame)
+          (incf start-point (websocket-frame-length current-frame)))))
+    (set-slot-value websocket 'inflight-input
+                    (substring text (or start-point 0)))))
+
+
+(defmethod websocket-verify-headers ((websocket websocket) output)
+  "Based on WEBSOCKET's data, ensure the headers in OUTPUT are valid.
+The output is assumed to have complete headers.  This function
+will either return t or call `error'.  This has the side-effect
+of populating the list of server extensions to WEBSOCKET."
+  (websocket-debug websocket "Checking headers: %s" output)
+  (let ((accept-string
+         (concat "Sec-WebSocket-Accept: "
+                 (slot-value websocket 'accept-string))))
+    (websocket-debug websocket "Checking for accept header: %s" accept-string)
+    (unless (string-match (regexp-quote accept-string) output)
+      (error "Incorrect handshake from websocket: is this really a websocket connection?")))
+  (let ((case-fold-search t))
+    (websocket-debug websocket "Checking for upgrade header")
+    (unless (string-match "\r\nUpgrade: websocket\r\n" output)
+      (error "No 'Upgrade: websocket' header found."))
+    (websocket-debug websocket "Checking for connection header")
+    (unless (string-match "\r\nConnection: upgrade\r\n" output)
+      (error "No 'Connection: upgrade' header found"))
+    ;; TODO(ahyatt) Implement checking for extensions
+    (when (slot-value websocket 'protocol)
+      (websocket-debug websocket "Checking for protocol match: %s"
+                       (slot-value websocket 'protocol))
+      (unless (string-match
+               (format "\r\nSec-Websocket-Protocol: %s\r\n"
+                       (slot-value websocket 'protocol)) output)
+        (error "Incorrect or missing protocol returned by the server.")))
+    (let ((pos 0)
+          (extensions))
+      (while (and pos
+                  (string-match "\r\nSec-Websocket-Extensions: \\(.*\\)\r\n"
+                      output pos))
+        (when (setq pos (match-end 1))
+          (setq extensions (append extensions (split-string
+                                               (match-string 1 output) ", ?")))))
+      (let ((extra-extensions))
+        (dolist (ext extensions)
+          (when (not (member
+                      (first (split-string ext "; ?"))
+                      (slot-value websocket 'extensions)))
+            (add-to-list 'extra-extensions (first (split-string ext "; ?")))))
+        (when extra-extensions
+          (error "Non-requested extensions returned by server: %s"
+                 extra-extensions)))
+      (set-slot-value websocket 'server-extensions extensions)))
+  ;; return true
+  t)
+
+(defmethod websocket-process-frame ((websocket websocket) frame)
+  "Using the WEBSOCKET's filter and connection, process the FRAME.
+If the frame has a payload, the frame is passed to the filter
+slot of WEBSOCKET.  If the frame is a ping, we reply with a pong.
+If the frame is a close, we terminate the connection."
+  (let ((opcode (websocket-frame-opcode frame)))
+    (cond ((memq opcode '(continuation text binary))
+           (condition-case err (websocket-on-message websocket frame)
+             (error (websocket-error
+                     websocket
+                     "Got error from the on-message function: %s"
+                     (error-message-string err)))))
+          ((eq opcode 'ping)
+           (websocket-send websocket
+                           (make-websocket-frame :opcode 'pong :completep t)))
+          ((eq opcode 'close)
+           (delete-process (slot-value websocket 'conn))))))
+
+(defmethod websocket-send-text ((websocket websocket) text)
+  "To the WEBSOCKET, send TEXT as a complete frame."
+  (websocket-send websocket (make-websocket-frame :opcode 'text :payload text
+                                                  :completep t)))
 
 (defvar websocket-debug nil
   "Set to true to output debugging info to a per-websocket buffer.
@@ -271,9 +451,10 @@ the frame finishes.  If the frame is not completed, return NIL."
        :length payload-end
        :completep (> fin 0)))))
 
-(defun* websocket-open (url &key protocol extensions (on-open 'identity)
-                            (on-message 'identity) (on-close 'identity))
-  "Open a websocket connection to URL, returning the `websocket' struct.
+(defun* websocket-open (websocket-class url &key protocol extensions)
+  "Open a websocket of type WEBSOCKET-CLASS, having a connection to URL.
+
+This returning the `websocket' class created.
 The PROTOCOL argument is optional, and setting it will declare to
 the server that this client supports the protocol.  We will
 require that the server also has to support that protocol.
@@ -284,22 +465,6 @@ which is the list of parameter strings to use for that extension.
 The parameter strings are of the form \"key=value\" or \"value\".
 EXTENSIONS can be NIL if none are in use.  An example value would
 be '(\"deflate-stream\" . (\"mux\" \"max-channels=4\")).
-
-Optionally you can specify
-ON_OPEN, ON-MESSAGE and ON-CLOSE callbacks as well.
-
-The ON-OPEN callback is called after the connection is
-established with the websocket as the only argument.  The return
-value is unused.
-
-The ON-MESSAGE callback is called after receiving a frame, and is
-called with the websocket as the first argument and
-`websocket-frame' struct as the second.  The return value is
-unused.
-
-The ON-CLOSE callback is called after the connection is closed, or
-failed to open.  It is called with the websocket as the only
-argument, and the return value is unused.
 
 For each of these event handlers, the client code can store
 arbitrary data in the `client-data' slot in the returned
@@ -326,16 +491,12 @@ variable `websocket-debug' to t."
                  (if (equal (url-type url-struct) "wss")
                      (error "Not implemented yet")
                    (error "Unknown protocol"))))
-         (websocket (websocket-inner-create
+         (websocket (make-instance websocket-class
                      :conn conn
                      :url url
-                     :on-open on-open
-                     :on-message on-message
-                     :on-close on-close
                      :protocol protocol
                      :extensions (mapcar 'car extensions)
-                     :accept-string
-                     (websocket-calculate-accept key))))
+                     :accept-string (websocket-calculate-accept key))))
     (process-put conn :websocket websocket)
     (set-process-filter conn
                         (lambda (process output)
@@ -348,12 +509,10 @@ variable `websocket-debug' to t."
          (websocket-debug websocket
                           "State change to %s" change)
          (unless (eq 'closed (websocket-ready-state websocket))
-           (condition-case err
-               (funcall (websocket-on-close websocket)
-                        websocket)
+           (condition-case err (websocket-on-close websocket)
              (error (websocket-error
                      websocket
-                     "Got error from the op-close function: %s")))))))
+                     "Got error from the on-close function: %s")))))))
     (set-process-query-on-exit-flag conn nil)
     (process-send-string conn
                          (format "GET %s HTTP/1.1\r\n"
@@ -403,17 +562,6 @@ These are defined as in `websocket-open'."
     (apply 'message msg args))
   (apply 'websocket-debug websocket msg args))
 
-(defun websocket-debug (websocket msg &rest args)
-  "In the WEBSOCKET's debug buffer, send MSG, with format ARGS."
-  (when websocket-debug
-    (let ((buf (websocket-get-debug-buffer-create websocket)))
-      (save-excursion
-        (with-current-buffer buf
-          (goto-char (point-max))
-          (insert "[WS] ")
-          (insert (apply 'format (append (list msg) args)))
-          (insert "\n"))))))
-
 (defun websocket-verify-response-code (output)
   "Verify that OUTPUT contains a valid HTTP response code.
 The only acceptable one to websocket is responce code 101.
@@ -425,167 +573,12 @@ if not."
               (match-string 1 output)))
   t)
 
-(defun websocket-verify-headers (websocket output)
-  "Based on WEBSOCKET's data, ensure the headers in OUTPUT are valid.
-The output is assumed to have complete headers.  This function
-will either return t or call `error'.  This has the side-effect
-of populating the list of server extensions to WEBSOCKET."
-  (websocket-debug websocket "Checking headers: %s" output)
-  (let ((accept-string
-         (concat "Sec-WebSocket-Accept: " (websocket-accept-string websocket))))
-    (websocket-debug websocket "Checking for accept header: %s" accept-string)
-    (unless (string-match (regexp-quote accept-string) output)
-      (error "Incorrect handshake from websocket: is this really a websocket connection?")))
-  (let ((case-fold-search t))
-    (websocket-debug websocket "Checking for upgrade header")
-    (unless (string-match "\r\nUpgrade: websocket\r\n" output)
-      (error "No 'Upgrade: websocket' header found."))
-    (websocket-debug websocket "Checking for connection header")
-    (unless (string-match "\r\nConnection: upgrade\r\n" output)
-      (error "No 'Connection: upgrade' header found"))
-    ;; TODO(ahyatt) Implement checking for extensions
-    (when (websocket-protocol websocket)
-      (websocket-debug websocket "Checking for protocol match: %s"
-                       (websocket-protocol websocket))
-      (unless (string-match
-               (format "\r\nSec-Websocket-Protocol: %s\r\n"
-                       (websocket-protocol websocket)) output)
-        (error "Incorrect or missing protocol returned by the server.")))
-    (let ((pos 0)
-          (extensions))
-      (while (and pos
-                  (string-match "\r\nSec-Websocket-Extensions: \\(.*\\)\r\n"
-                      output pos))
-        (when (setq pos (match-end 1))
-          (setq extensions (append extensions (split-string
-                                               (match-string 1 output) ", ?")))))
-      (let ((extra-extensions))
-        (dolist (ext extensions)
-          (when (not (member
-                      (first (split-string ext "; ?"))
-                      (websocket-extensions websocket)))
-            (add-to-list 'extra-extensions (first (split-string ext "; ?")))))
-        (when extra-extensions
-          (error "Non-requested extensions returned by server: %s"
-                 extra-extensions)))
-      (setf (websocket-server-extensions websocket) extensions)))
-  ;; return true
-  t)
-
-(defun websocket-process-frame (websocket frame)
-  "Using the WEBSOCKET's filter and connection, process the FRAME.
-If the frame has a payload, the frame is passed to the filter
-slot of WEBSOCKET.  If the frame is a ping, we reply with a pong.
-If the frame is a close, we terminate the connection."
-  (let ((opcode (websocket-frame-opcode frame)))
-    (cond ((memq opcode '(continuation text binary))
-           (condition-case err
-               (funcall (websocket-on-message websocket) websocket frame)
-             (error (websocket-error websocket
-                                     "Got error from the on-message function: %s"
-                                     (error-message-string err)))))
-          ((eq opcode 'ping)
-           (websocket-send websocket
-                           (make-websocket-frame :opcode 'pong :completep t)))
-          ((eq opcode 'close)
-           (delete-process (websocket-conn websocket))))))
-
-(defun websocket-outer-filter (websocket output)
-  "Filter the WEBSOCKET server's OUTPUT.
-This will parse headers and process frames repeatedly until there
-is no more output or the connection closes.  If the websocket
-connection is invalid, the connection will be closed."
-  (websocket-debug websocket "Received: %s" output)
-  (let ((start-point)
-        (end-point 0)
-        (text (concat (websocket-inflight-input websocket) output))
-        (header-end-pos))
-    ;; If we've received the complete header, check to see if we've
-    ;; received the desired handshake.
-    (when (and (eq 'connecting (websocket-ready-state websocket))
-               (setq header-end-pos (string-match "\r\n\r\n" text))
-               (setq start-point (+ 4 header-end-pos)))
-      (condition-case err
-          (progn
-            (websocket-verify-response-code text)
-            (websocket-verify-headers websocket text))
-        (error
-         (websocket-close websocket)
-         (error err)))
-      (setf (websocket-ready-state websocket) 'open)
-      (condition-case err
-          (funcall (websocket-on-open websocket) websocket)
-        (error (websocket-error websocket
-                                "Got error from the on-open function: %s"
-                                (error-message-string err)))))
-    (when (eq 'open (websocket-ready-state websocket))
-      (unless start-point (setq start-point 0))
-      (let ((current-frame))
-        (while (and (setq current-frame (websocket-read-frame
-                                         (substring text start-point))))
-          (websocket-process-frame websocket current-frame)
-          (incf start-point (websocket-frame-length current-frame)))))
-    (setf (websocket-inflight-input websocket)
-        (substring text (or start-point 0)))))
-
-(defun websocket-send-text (websocket text)
-  "To the WEBSOCKET, send TEXT as a complete frame."
-  (websocket-send websocket (make-websocket-frame :opcode 'text :payload text
-                                                  :completep t)))
-
 (defun websocket-check (frame)
   "Check FRAME for correctness, returning true if correct."
   (and (equal (not (memq (websocket-frame-opcode frame)
                          '(continuation text binary)))
               (and (not (websocket-frame-payload frame))
                    (websocket-frame-completep frame)))))
-
-(defun websocket-send (websocket frame)
-  "To the WEBSOCKET server, send the FRAME.
-This will raise an error if the frame is illegal."
-  (unless (websocket-check frame)
-    (error "Cannot send illegal frame to websocket"))
-  (websocket-debug websocket "Sending frame, opcode: %s payload: %s"
-                   (websocket-frame-opcode frame)
-                   (websocket-frame-payload frame))
-  (websocket-ensure-connected websocket)
-  (unless (websocket-openp websocket)
-    (error "No webserver process to send data to!"))
-  (process-send-string (websocket-conn websocket)
-                       (websocket-encode-frame frame)))
-
-(defun websocket-openp (websocket)
-  "Check WEBSOCKET and return non-nil if it is open, and either
-connecting or open."
-  (and websocket
-       (not (eq 'close (websocket-ready-state websocket)))
-       (eq 'open (process-status (websocket-conn websocket)))))
-
-(defun websocket-close (websocket)
-  "Close WEBSOCKET and erase all the old websocket data."
-  (websocket-debug websocket "Closing websocket")
-  (when (websocket-openp websocket)
-    (websocket-send websocket
-                    (make-websocket-frame :opcode 'close
-                                          :completep t))
-    (setf (websocket-ready-state websocket) 'closed))
-  ;; Do we want to kill this?  It may result in on-closed not being
-  ;; called.
-  (kill-buffer (process-buffer (websocket-conn websocket))))
-
-(defun websocket-ensure-connected (websocket)
-  "If the WEBSOCKET connection is closed, open it."
-  (unless (and (websocket-conn websocket)
-               (ecase (process-status (websocket-conn websocket))
-                 ((run open listen) t)
-                 ((stop exit signal closed connect failed nil) nil)))
-    (websocket-close websocket)
-    (websocket-open (websocket-url websocket)
-                    :protocol (websocket-protocol websocket)
-                    :extensions (websocket-extensions websocket)
-                    :on-open (websocket-on-open websocket)
-                    :on-message (websocket-on-message websocket)
-                    :on-close (websocket-on-close websocket))))
 
 (provide 'websocket)
 

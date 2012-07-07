@@ -118,19 +118,13 @@
         (invalid-accept "Sec-WebSocket-Accept: bad")
         (upgrade "Upgrade: websocket")
         (connection "Connection: upgrade")
-        (ws (websocket-inner-create
-             :conn "fake-conn" :url "ws://foo/bar"
-             :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))
+        (ws (websocket :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))
         (ws-with-protocol
-         (websocket-inner-create
-             :conn "fake-conn" :url "ws://foo/bar"
-             :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-             :protocol "myprotocol"))
+         (websocket :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+                    :protocol "myprotocol"))
         (ws-with-extensions
-         (websocket-inner-create
-             :conn "fake-conn" :url "ws://foo/bar"
-             :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-             :extensions '("ext1" "ext2"))))
+         (websocket :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+                    :extensions '("ext1" "ext2"))))
     (should (websocket-verify-headers
              ws
              (websocket-test-header-with-lines accept upgrade connection)))
@@ -204,17 +198,38 @@
                                        '(("ext1" . ("a" "b=2"))
                                          ("ext2")))))))
 
+(defclass websocket-testable (websocket)
+  ((on-message :initarg :on-message
+               :initform (lambda (ws frame))
+               :type function
+               :protection public)
+   (on-open :initarg :on-open
+            :initform identity
+            :type function
+            :protection public)
+   (on-close :initarg :on-close
+             :initform identity
+             :type function
+             :protection public)))
+
+(defmethod websocket-on-open ((ws websocket-testable))
+  (funcall (slot-value ws 'on-open) ws))
+
+(defmethod websocket-on-message ((ws websocket-testable) frame)
+  (funcall (slot-value ws 'on-message) ws frame))
+
+(defmethod websocket-on-close ((ws websocket-testable))
+  (funcall (slot-value ws 'on-close) ws))
+
 (ert-deftest websocket-process-frame ()
   (let* ((sent)
          (processed)
          (deleted)
-         (websocket (websocket-inner-create
-                     :conn t :url t
+         (websocket (websocket-testable 
                      :on-message (lambda (websocket frame)
                                    (setq
                                     processed
-                                    (websocket-frame-payload frame)))
-                     :accept-string t)))
+                                    (websocket-frame-payload frame))))))
     (dolist (opcode '(text binary continuation))
       (setq processed nil)
       (should (equal
@@ -289,17 +304,13 @@
            (websocket-openp (websocket) t)
            (kill-buffer (buffer))
            (process-buffer (conn)))
-      (websocket-close (websocket-inner-create
-                        :conn "fake-conn"
-                        :url t
-                        :accept-string t))
+      (websocket-close (websocket "test"))
       (should (equal sent-frames (list
                                   (make-websocket-frame :opcode 'close
                                                         :completep t)))))))
 
 (ert-deftest websocket-outer-filter ()
-  (let* ((fake-ws (websocket-inner-create
-                   :conn t :url t :accept-string t
+  (let* ((fake-ws (websocket-testable "test"
                    :on-open (lambda (websocket)
                               (should (eq (websocket-ready-state websocket)
                                           'open))
@@ -334,10 +345,11 @@
 (ert-deftest websocket-outer-filter-bad-connection ()
   (let* ((on-open-calledp)
          (websocket-closed-calledp)
-         (fake-ws (websocket-inner-create
-                   :conn t :url t :accept-string t
+         (fake-ws (websocket-testable "test"
                    :on-open (lambda (websocket)
-                              (setq on-open-calledp t)))))
+                              (setq on-open-calledp t))
+                   :on-close (lambda (websocket)
+                                (setq websocketd-closed-calledp t)))))
     (flet ((websocket-verify-response-code (output) t)
            (websocket-verify-headers (websocket output) (error "Bad headers!"))
            (websocket-close (websocket) (setq websocket-closed-calledp t)))
@@ -352,13 +364,11 @@
   (frames &optional callback)
   (let* ((filter-frames)
          (websocket
-          (websocket-inner-create
-           :conn "fake-conn"
+          (websocket-testable "test"
            :on-message (lambda (websocket frame)
                          (push frame filter-frames)
                          (when callback (funcall callback)))
-           :on-close (lambda (not-called) (assert nil))
-           :url t :accept-string t))
+           :on-close (lambda (not-called) (assert nil))))
          err-list)
     (dolist (frame frames)
       (condition-case err
@@ -399,7 +409,7 @@
     (should (equal err-list nil)))))
 
 (ert-deftest websocket-send ()
-  (let ((ws (websocket-inner-create :conn t :url t :accept-string t)))
+  (let ((ws (websocket "test")))
     (flet ((websocket-ensure-connected (websocket))
            (websocket-openp (websocket) t)
            (process-send-string (conn string)))

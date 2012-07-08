@@ -19,13 +19,19 @@
 
 (message "Opening the websocket")
 
+(defclass websocket-for-test (websocket)
+  ;; no new slots needed
+  ())
+
+(defmethod websocket-on-message ((ws websocket-for-test) frame)
+  (push (websocket-frame-payload frame) wstest-msgs)
+  (message "ws frame: %S" (websocket-frame-payload frame)))
+
+(defmethod websocket-on-close ((ws websocket-for-test))
+  (setq wstest-closed t))
+
 (defvar wstest-ws
-  (websocket-open
-   "ws://127.0.0.1:9999"
-   :on-message (lambda (websocket frame)
-                 (push (websocket-frame-payload frame) wstest-msgs)
-                 (message "ws frame: %S" (websocket-frame-payload frame)))
-   :on-close (lambda (websocket) (setq wstest-closed t))))
+  (websocket-open 'websocket-for-test "ws://127.0.0.1:9999"))
 
 (defun wstest-pop-to-debug ()
   "Open websocket log buffer. Not used in testing. Just for debugging."

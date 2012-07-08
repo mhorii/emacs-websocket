@@ -28,6 +28,23 @@
 (require 'websocket)
 (eval-when-compile (require 'cl))
 
+(defvar websocket-test-process (start-process "dummy-process" "dummy-process"
+                                              "echo")
+  "Dummy variable so that we can fake out a connection process.")
+
+(defun* websocket-test-websocket (&key on-open on-message on-close
+                                       (accept-string "")
+                                       protocol
+                                       extensions)
+  (let ((ws (websocket-testable "test" :protocol protocol)))
+    (websocket-private-initialize ws websocket-test-process accept-string)
+    (when on-open (set-slot-value ws 'on-open on-open))
+    (when on-message (set-slot-value ws 'on-message on-message))
+    (when on-close (set-slot-value ws 'on-close on-close))
+    ;; This can't be set during construction.
+    (when extensions (set-slot-value ws 'requested-extensions extensions))
+    ws))
+
 (ert-deftest websocket-genbytes-length ()
   (loop repeat 100
         do (should (= (string-bytes (websocket-genbytes 16)) 16))))
@@ -118,13 +135,16 @@
         (invalid-accept "Sec-WebSocket-Accept: bad")
         (upgrade "Upgrade: websocket")
         (connection "Connection: upgrade")
-        (ws (websocket :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))
+        (ws (websocket-test-websocket
+             :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))
         (ws-with-protocol
-         (websocket :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-                    :protocol "myprotocol"))
+         (websocket-test-websocket
+          :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+          :protocol "myprotocol"))
         (ws-with-extensions
-         (websocket :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-                    :extensions '("ext1" "ext2"))))
+         (websocket-test-websocket
+          :accept-string "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+          :extensions '("ext1" "ext2"))))
     (should (websocket-verify-headers
              ws
              (websocket-test-header-with-lines accept upgrade connection)))
@@ -165,7 +185,7 @@
       (websocket-test-header-with-lines
        accept upgrade connection "Sec-Websocket-Extensions: ext1, ext2; a=1")))
     (should (equal '("ext1" "ext2; a=1")
-                   (websocket-server-extensions ws-with-extensions)))
+                   (slot-value ws-with-extensions 'extensions)))
     (should
      (websocket-verify-headers
       ws-with-extensions
@@ -173,7 +193,7 @@
                                         "Sec-Websocket-Extensions: ext1"
                                         "Sec-Websocket-Extensions: ext2; a=1")))
     (should (equal '("ext1" "ext2; a=1")
-                   (websocket-server-extensions ws-with-extensions)))))
+                   (slot-value ws-with-extensions 'extensions)))))
 
 (ert-deftest websocket-create-headers ()
   (let ((system-name "mysystem")
@@ -223,9 +243,9 @@
 
 (ert-deftest websocket-process-frame ()
   (let* ((sent)
-         (processed)
+        (processed)
          (deleted)
-         (websocket (websocket-testable 
+         (websocket (websocket-test-websocket
                      :on-message (lambda (websocket frame)
                                    (setq
                                     processed
@@ -304,15 +324,15 @@
            (websocket-openp (websocket) t)
            (kill-buffer (buffer))
            (process-buffer (conn)))
-      (websocket-close (websocket "test"))
+      (websocket-close (websocket-test-websocket))
       (should (equal sent-frames (list
                                   (make-websocket-frame :opcode 'close
                                                         :completep t)))))))
 
 (ert-deftest websocket-outer-filter ()
-  (let* ((fake-ws (websocket-testable "test"
+  (let* ((fake-ws (websocket-test-websocket
                    :on-open (lambda (websocket)
-                              (should (eq (websocket-ready-state websocket)
+                              (should (eq (slot-value websocket 'ready-state)
                                           'open))
                               (setq open-callback-called t)
                               (error "Ignore me!"))))
@@ -331,7 +351,7 @@
            (websocket-verify-response-code (output) t)
            (websocket-verify-headers (websocket output) t))
       (websocket-outer-filter fake-ws "Sec-")
-      (should (eq (websocket-ready-state fake-ws) 'connecting))
+      (should (eq (slot-value fake-ws 'ready-state) 'connecting))
       (should-not open-callback-called)
       (websocket-outer-filter fake-ws "WebSocket-Accept: acceptstring")
       (should-not open-callback-called)
@@ -345,7 +365,7 @@
 (ert-deftest websocket-outer-filter-bad-connection ()
   (let* ((on-open-calledp)
          (websocket-closed-calledp)
-         (fake-ws (websocket-testable "test"
+         (fake-ws (websocket-test-websocket
                    :on-open (lambda (websocket)
                               (setq on-open-calledp t))
                    :on-close (lambda (websocket)
@@ -364,7 +384,7 @@
   (frames &optional callback)
   (let* ((filter-frames)
          (websocket
-          (websocket-testable "test"
+          (websocket-test-websocket
            :on-message (lambda (websocket frame)
                          (push frame filter-frames)
                          (when callback (funcall callback)))
@@ -409,7 +429,7 @@
     (should (equal err-list nil)))))
 
 (ert-deftest websocket-send ()
-  (let ((ws (websocket "test")))
+  (let ((ws (websocket-test-websocket)))
     (flet ((websocket-ensure-connected (websocket))
            (websocket-openp (websocket) t)
            (process-send-string (conn string)))

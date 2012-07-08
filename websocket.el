@@ -49,19 +49,26 @@
                 :documentation
                 "The state of the connection, either CONNECTING, OPEN or CLOSE"
                 :protection :public)
-   (server-extensions :type list
-                      :documentation "The list of extensions the server supports"
-                      :protection :protected)
+   (client-extensions :type list
+               :documentation "The list of the extensions the client supports"
+               :protection :public)
+   (requested-extensions :initarg :requested-extensions
+                         :type list
+                         :documentation "The list of client-requested extensions"
+                         :protection :public)
+   (extensions :type list
+               :documentation "The list of extensions in use"
+               :protection :public)
    (url :initarg :url
         :type string
         :documentation "The url this websocket is connecting to."
         :protection :protected)
    (protocol :initarg :protocol
-             :type string
+             :type (or null string)
              :websocket "The protocol requested by the client"
              :protection :protected)
    (conn :initarg :conn
-         :type processp
+         :type process
          :documentation "The connection process for this websocket."
          :protection :private)
    (accept-string :initarg :accept-string
@@ -102,6 +109,11 @@ Putting all client initialization logic here is recommended.")
 (defmethod websocket-on-close ((ws websocket))
   "Called when the websocket connection has been closed.")
 
+(defmethod websocket-private-initialize ((ws websocket) conn accept-string)
+  "Method to initialize private variables, which cannot be set in the constructor."
+  (set-slot-value ws 'conn conn)
+  (set-slot-value ws 'accept-string accept-string))
+
 (defmethod websocket-debug ((ws websocket) msg &rest args)
   "In the WEBSOCKET's debug buffer, send MSG, with format ARGS."
   (when websocket-debug
@@ -131,8 +143,8 @@ This will raise an error if the frame is illegal."
   "Check WEBSOCKET and return non-nil if it is open, and either
 connecting or open."
   (and websocket
-       (not (eq 'close (websocket-ready-state websocket)))
-       (eq 'open (process-status (websocket-conn websocket)))))
+       (not (eq 'close (slot-value websocket 'ready-state)))
+       (eq 'open (process-status (slot-value websocket 'conn)))))
 
 (defmethod websocket-close ((websocket websocket))
   "Close WEBSOCKET and erase all the old websocket data."
@@ -148,15 +160,16 @@ connecting or open."
 
 (defmethod websocket-ensure-connected ((websocket websocket))
   "If the WEBSOCKET connection is closed, open it."
-  (unless (and (websocket-conn websocket)
-               (ecase (process-status (websocket-conn websocket))
+  (unless (and (slot-value websocket 'conn)
+               (ecase (process-status (slot-value websocket 'conn))
                  ((run open listen) t)
                  ((stop exit signal closed connect failed nil) nil)))
     (websocket-close websocket)
     (websocket-open (object-class websocket)
                     (websocket-url websocket)
-                    :protocol (websocket-protocol websocket)
-                    :extensions (websocket-extensions websocket))))
+                    :protocol (slot-value websocket 'protocol)
+                    ;; We just re-open with the set of agreed upon extensions.
+                    :extensions (slot-value websocket 'extensions))))
 
 (defmethod websocket-outer-filter ((websocket websocket) output)
   "Filter the WEBSOCKET server's OUTPUT.
@@ -180,7 +193,7 @@ connection is invalid, the connection will be closed."
         (error
          (websocket-close websocket)
          (error err)))
-      (set-slot-value 'ready-state 'open)
+      (set-slot-value websocket 'ready-state 'open)
       (condition-case err (websocket-on-open websocket) 
         (error (websocket-error websocket
                                 "Got error from the on-open function: %s"
@@ -235,12 +248,12 @@ of populating the list of server extensions to WEBSOCKET."
         (dolist (ext extensions)
           (when (not (member
                       (first (split-string ext "; ?"))
-                      (slot-value websocket 'extensions)))
+                      (slot-value websocket 'requested-extensions)))
             (add-to-list 'extra-extensions (first (split-string ext "; ?")))))
         (when extra-extensions
           (error "Non-requested extensions returned by server: %s"
                  extra-extensions)))
-      (set-slot-value websocket 'server-extensions extensions)))
+      (set-slot-value websocket 'extensions extensions)))
   ;; return true
   t)
 
@@ -492,11 +505,11 @@ variable `websocket-debug' to t."
                      (error "Not implemented yet")
                    (error "Unknown protocol"))))
          (websocket (make-instance websocket-class
-                     :conn conn
                      :url url
-                     :protocol protocol
-                     :extensions (mapcar 'car extensions)
-                     :accept-string (websocket-calculate-accept key))))
+                     :requested-extensions extensions
+                     :protocol protocol))
+         (accept-string (websocket-calculate-accept key)))
+    (websocket-private-initialize websocket conn accept-string)
     (process-put conn :websocket websocket)
     (set-process-filter conn
                         (lambda (process output)
@@ -508,7 +521,7 @@ variable `websocket-debug' to t."
        (let ((websocket (process-get process :websocket)))
          (websocket-debug websocket
                           "State change to %s" change)
-         (unless (eq 'closed (websocket-ready-state websocket))
+         (unless (eq 'closed (slot-value websocket 'ready-state))
            (condition-case err (websocket-on-close websocket)
              (error (websocket-error
                      websocket
@@ -519,7 +532,7 @@ variable `websocket-debug' to t."
                                  (let ((path (url-filename url-struct)))
                                    (if (> (length path) 0) path "/"))))
     (websocket-debug websocket "Sending handshake, key: %s, acceptance: %s"
-                     key (websocket-accept-string websocket))
+                     key accept-string)
     (process-send-string conn
                          (websocket-create-headers url key protocol extensions))
     (websocket-debug websocket "Websocket opened")
@@ -553,8 +566,7 @@ These are defined as in `websocket-open'."
 
 (defun websocket-get-debug-buffer-create (websocket)
   "Get or create the buffer corresponding to WEBSOCKET."
-  (get-buffer-create (format " *websocket %s debug*"
-                             (websocket-url websocket))))
+  (get-buffer-create (format " *websocket %s debug*" (slot-value websocket 'url))))
 
 (defun websocket-error (websocket msg &rest args)
   "Report error message MSG."

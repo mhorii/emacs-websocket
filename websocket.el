@@ -595,7 +595,7 @@ connecting or open."
 ;; Websocket client ;;
 ;;;;;;;;;;;;;;;;;;;;;;
 
-(defun* websocket-open (url &key protocols extensions (on-open 'identity)
+(defun* websocket-open (url &key protocols extensions cookies (on-open 'identity)
                             (on-message (lambda (_w _f))) (on-close 'identity)
                             (on-error 'websocket-default-error-handler))
   "Open a websocket connection to URL, returning the `websocket' struct.
@@ -610,6 +610,9 @@ which is the list of parameter strings to use for that extension.
 The parameter strings are of the form \"key=value\" or \"value\".
 EXTENSIONS can be NIL if none are in use.  An example value would
 be '(\"deflate-stream\" . (\"mux\" \"max-channels=4\")).
+
+If there are any cookies that need to be passed with the request,
+specify them in COOKIES per RFC6265.
 
 Optionally you can specify
 ON-OPEN, ON-MESSAGE and ON-CLOSE callbacks as well.
@@ -717,7 +720,7 @@ describing the problem with the frame.
     (websocket-debug websocket "Sending handshake, key: %s, acceptance: %s"
                      key (websocket-accept-string websocket))
     (process-send-string conn
-                         (websocket-create-headers url key protocols extensions))
+                         (websocket-create-headers url key protocols extensions cookies))
     (websocket-debug websocket "Websocket opened")
     websocket))
 
@@ -867,33 +870,38 @@ connection, which should be kept in order to pass to
                 (not (eq 'closed (websocket-ready-state websocket))))
            (websocket-try-callback 'websocket-on-close 'on-close websocket)))))))
 
-(defun websocket-create-headers (url key protocol extensions)
-  "Create connections headers for the given URL, KEY, PROTOCOL and EXTENSIONS.
+(defun websocket-create-headers (url key protocol extensions cookies)
+  "Create connections headers for the given URL, KEY, PROTOCOL, EXTENSIONS and COOKIES.
 These are defined as in `websocket-open'."
-  (format (concat "Host: %s\r\n"
-                  "Upgrade: websocket\r\n"
-                  "Connection: Upgrade\r\n"
-                  "Sec-WebSocket-Key: %s\r\n"
-                  "Sec-WebSocket-Version: 13\r\n"
-                  (when protocol
-                    (concat
-                     (mapconcat (lambda (protocol)
-                                  (format "Sec-WebSocket-Protocol: %s" protocol))
-                                protocol "\r\n")
-                     "\r\n"))
-                  (when extensions
-                    (format "Sec-WebSocket-Extensions: %s\r\n"
-                            (mapconcat
-                             (lambda (ext)
-                               (concat (car ext)
-                                       (when (cdr ext) "; ")
-                                       (when (cdr ext)
-                                         (mapconcat 'identity (cdr ext) "; "))))
-                             extensions ", ")))
-                  "\r\n")
-          (url-host (url-generic-parse-url url))
-          key
-          protocol))
+  (let ((url (url-generic-parse-url url)))
+    (format (concat "Host: %s\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Key: %s\r\n"
+                    "Sec-WebSocket-Version: 13\r\n"
+                    (when protocol
+                      (concat
+                       (mapconcat (lambda (protocol)
+                                    (format "Sec-WebSocket-Protocol: %s" protocol))
+                                  protocol "\r\n")
+                       "\r\n"))
+                    (when extensions
+                      (format "Sec-WebSocket-Extensions: %s\r\n"
+                              (mapconcat
+                               (lambda (ext)
+                                 (concat (car ext)
+                                         (when (cdr ext) "; ")
+                                         (when (cdr ext)
+                                           (mapconcat 'identity (cdr ext) "; "))))
+                               extensions ", ")))
+                    (when cookies
+                      (format "Cookie: %s\r\n" cookies))
+                    "\r\n")
+            (if (url-port url)
+                (format "%s:%s" (url-host url) (url-port url))
+              (url-host url))
+            key
+            protocol)))
 
 (defun websocket-get-server-response (websocket client-protocols client-extensions)
   "Get the websocket response from client WEBSOCKET."
